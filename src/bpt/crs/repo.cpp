@@ -13,6 +13,7 @@
 #include <bpt/util/db/query.hpp>
 #include <bpt/util/fs/io.hpp>
 #include <bpt/util/fs/shutil.hpp>
+#include <bpt/util/json5/parse.hpp>
 #include <bpt/util/log.hpp>
 
 #include <neo/event.hpp>
@@ -22,6 +23,13 @@
 #include <neo/sqlite3/transaction.hpp>
 #include <neo/tar/util.hpp>
 #include <neo/ufmt.hpp>
+
+// test
+#include <neo/as_buffer.hpp>
+#include <neo/iostream_io.hpp> // neo::iostream_io
+#include <neo/gzip_io.hpp> // neo::gzip_io
+#include <neo/tar/ustar.hpp> // neo::ustar_reader
+#include <fstream>
 
 using namespace bpt;
 using namespace bpt::crs;
@@ -83,6 +91,59 @@ void archive_package_libraries(path_ref from_dir, path_ref dest_root, const pack
     }
 }
 
+void validate_package_info(const package_info& pkg)
+{
+    if (pkg.id.revision < 1) {
+        BOOST_LEAF_THROW_EXCEPTION(e_repo_import_invalid_pkg_version{
+            "Package pkg-version must be a positive non-zero integer in order to be imported into "
+            "a repository"});
+    }
+}
+
+void expand_single_file_from_targz(path_ref tgz_source, path_ref destination, path_ref filter) {
+    std::ifstream in;
+    in.exceptions(in.exceptions() | std::ios::badbit);
+    in.open(tgz_source, std::ios::binary);
+
+    neo::iostream_io  file_in{in};
+    neo::gzip_source  gz_in{file_in};
+    neo::ustar_reader tar_reader{gz_in};
+
+    for (const auto& meminfo : tar_reader) {
+        fs::path filepath = meminfo.filename_str();
+        if (!meminfo.prefix_str().empty()) {
+            filepath = meminfo.prefix_str() / filepath;
+        }
+
+        if (filepath == filter) {
+            if (!meminfo.is_file()) {
+                throw std::runtime_error(
+                    neo::ufmt("Don't know how to expand archive member. Archive "
+                              "is [{}], member is [{}], type is [{}].",
+                              tgz_source.string(),
+                              filepath.string(),
+                              char(meminfo.typeflag)));
+            }
+            std::ofstream ofile;
+            ofile.exceptions(ofile.exceptions() | std::ios::badbit | std::ios::failbit);
+            errno = 0;
+            try {
+                ofile.open(destination, std::ios::binary);
+                neo::iostream_io data_sink{ofile};
+                buffer_copy(data_sink, tar_reader.all_data());
+            } catch (const std::system_error& e) {
+                throw std::
+                    system_error(std::error_code(errno, std::generic_category()),
+                                 neo::ufmt("Failure while extractive archive member to [{}]: {}",
+                                           destination.string(),
+                                           e.what()));
+            }
+            ofile.close();
+            break; // Found.
+        }
+    }
+}
+
 }  // namespace
 
 void repository::_vacuum_and_compress() const {
@@ -131,29 +192,16 @@ fs::path repository::subdir_of(const package_info& pkg) const noexcept {
         / neo::ufmt("{}~{}", pkg.id.version.to_string(), pkg.id.revision);
 }
 
-void repository::import_dir(path_ref dirpath) {
-    BPT_E_SCOPE(e_repo_importing_dir{dirpath});
-    auto  sd  = sdist::from_directory(dirpath);
-    auto& pkg = sd.pkg;
+void repository::import_targz(path_ref tgz_path) {
+    BPT_E_SCOPE(e_repo_importing_dir{tgz_path});
+    fs::create_directories(tmp_dir());
+    auto tmp_pkg_dir = bpt::temporary_dir::create_in(tmp_dir());
+    auto pkg_json = tmp_pkg_dir.path() / "pkg.json";
+    expand_single_file_from_targz(tgz_path, pkg_json, "pkg.json");
+    auto data = bpt::parse_json5_file(pkg_json);
+    auto pkg = crs::package_info::from_json_data(data);
     BPT_E_SCOPE(e_repo_importing_package{pkg});
-    auto dest_dir = subdir_of(pkg);
-    fs::create_directories(dest_dir);
-
-    // Copy the package into a temporary directory
-    auto prep_dir = bpt::temporary_dir::create_in(dest_dir);
-    archive_package_libraries(dirpath, prep_dir.path(), pkg);
-    fs::create_directories(prep_dir.path());
-    bpt::write_file(prep_dir.path() / "pkg.json", pkg.to_json(2));
-
-    auto tmp_tgz = pkg_dir() / (prep_dir.path().filename().string() + ".tgz");
-    neo::compress_directory_targz(prep_dir.path(), tmp_tgz);
-    neo_defer { std::ignore = ensure_absent(tmp_tgz); };
-
-    if (pkg.id.revision < 1) {
-        BOOST_LEAF_THROW_EXCEPTION(e_repo_import_invalid_pkg_version{
-            "Package pkg-version must be a positive non-zero integer in order to be imported into "
-            "a repository"});
-    }
+    validate_package_info(pkg);
 
     neo::sqlite3::transaction_guard tr{_db.sqlite3_db()};
     bpt_leaf_try {
@@ -169,6 +217,50 @@ void repository::import_dir(path_ref dirpath) {
         BOOST_LEAF_THROW_EXCEPTION(current_error(), e_repo_import_pkg_already_present{});
     };
 
+    auto dest_dir = subdir_of(pkg);
+    fs::create_directories(dest_dir);
+    bpt::copy_file(tgz_path, dest_dir / "pkg.tgz").value();
+    bpt::copy_file(pkg_json, dest_dir / "pkg.json").value();
+    tr.commit();
+    _vacuum_and_compress();
+
+    NEO_EMIT(ev_repo_imported_package{*this, tgz_path, pkg});
+}
+
+void repository::import_dir(path_ref dirpath) {
+    BPT_E_SCOPE(e_repo_importing_dir{dirpath});
+    auto  sd  = sdist::from_directory(dirpath);
+    auto& pkg = sd.pkg;
+    BPT_E_SCOPE(e_repo_importing_package{pkg});
+    validate_package_info(pkg);
+
+    // Copy the package into a temporary directory
+    fs::create_directories(tmp_dir());
+    auto prep_dir = bpt::temporary_dir::create_in(tmp_dir());
+    archive_package_libraries(dirpath, prep_dir.path(), pkg);
+    fs::create_directories(prep_dir.path());
+    bpt::write_file(prep_dir.path() / "pkg.json", pkg.to_json(2));
+
+    auto tmp_tgz = pkg_dir() / (prep_dir.path().filename().string() + ".tgz");
+    neo::compress_directory_targz(prep_dir.path(), tmp_tgz);
+    neo_defer { std::ignore = ensure_absent(tmp_tgz); };
+
+    neo::sqlite3::transaction_guard tr{_db.sqlite3_db()};
+    bpt_leaf_try {
+        db_exec(  //
+            _prepare(R"(
+                INSERT INTO crs_repo_packages (meta_json)
+                VALUES (?)
+            )"_sql),
+            std::string_view(pkg.to_json()))
+            .value();
+    }
+    bpt_leaf_catch(matchv<neo::sqlite3::errc::constraint_unique>) {
+        BOOST_LEAF_THROW_EXCEPTION(current_error(), e_repo_import_pkg_already_present{});
+    };
+
+    auto dest_dir = subdir_of(pkg);
+    fs::create_directories(dest_dir);
     move_file(tmp_tgz, dest_dir / "pkg.tgz").value();
     bpt::copy_file(prep_dir.path() / "pkg.json", dest_dir / "pkg.json").value();
     tr.commit();

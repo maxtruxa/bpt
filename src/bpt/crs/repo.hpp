@@ -31,6 +31,7 @@ public:
     std::filesystem::path subdir_of(const package_info&) const noexcept;
 
     auto        pkg_dir() const noexcept { return _dirpath / "pkg"; }
+    auto        tmp_dir() const noexcept { return _dirpath / "tmp"; }
     auto&       root() const noexcept { return _dirpath; }
     std::string name() const;
 

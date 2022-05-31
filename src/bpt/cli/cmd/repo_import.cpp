@@ -23,7 +23,14 @@ namespace bpt::cli::cmd {
 
 namespace {
 
-void _import_file(bpt::crs::repository& repo, path_ref dirpath) { repo.import_dir(dirpath); }
+void _import_file(bpt::crs::repository& repo, path_ref pkgpath) {
+    auto abs_path = fs::canonical(pkgpath);
+    if (fs::is_regular_file(abs_path)) {
+        repo.import_targz(pkgpath);
+    } else {
+        repo.import_dir(pkgpath);
+    }
+}
 
 int _repo_import(const options& opts) {
     auto repo = bpt::crs::repository::open_existing(opts.repo.repo_dir);
